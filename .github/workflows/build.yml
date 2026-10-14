@@ -1,0 +1,26 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Make Build Script Executable
+        run: chmod +x build_ipa.sh
+
+      - name: Run IPA Build Script
+        run: ./build_ipa.sh
+
+      - name: Upload Built IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidModRunner_iOS14_Package
+          path: DroidModRunner_iOS14.ipa
