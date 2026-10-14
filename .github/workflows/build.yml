@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: Generate Source Files and Compile IPA
+      - name: Compile IPA Without Heredoc
         run: |
           set -e
           APP_NAME="DroidModRunner"
@@ -23,8 +23,7 @@ jobs:
           rm -rf "${BUILD_DIR}" "${IPA_OUTPUT}"
           mkdir -p "${APP_BUNDLE}"
 
-          # 1. Создаем Bridging-Header.h
-          cat << 'EOF' > "${BUILD_DIR}/Bridging-Header.h"
+          printf '%s\n' '
           #ifndef Bridging_Header_h
           #define Bridging_Header_h
           #include <stdint.h>
@@ -36,10 +35,9 @@ jobs:
           int execute_android_arm64_so_function(const uint8_t *raw_machine_code, size_t code_size, int arg1, int arg2);
           int native_unzip_archive(const char *zip_path, const char *dest_dir);
           #endif
-          EOF
+          ' > "${BUILD_DIR}/Bridging-Header.h"
 
-          # 2. Создаем C-ядро (android_core.c) с совместимым с iOS SDK mprotect
-          cat << 'EOF' > "${BUILD_DIR}/android_core.c"
+          printf '%s\n' '
           #include "Bridging-Header.h"
           #include <stdio.h>
           #include <stdlib.h>
@@ -69,10 +67,10 @@ jobs:
               char tmp[1024];
               snprintf(tmp, sizeof(tmp), "%s", path);
               for (char *p = tmp + 1; *p; p++) {
-                  if (*p == '/') {
-                      *p = '\0';
+                  if (*p == 47) {
+                      *p = 0;
                       mkdir(tmp, 0755);
-                      *p = '/';
+                      *p = 47;
                   }
               }
           }
@@ -109,7 +107,7 @@ jobs:
                   snprintf(full_out_path, sizeof(full_out_path), "%s/%s", dest_dir, rel_name);
                   mkdir_recursive(full_out_path);
 
-                  if (strlen(rel_name) > 0 && rel_name[strlen(rel_name) - 1] != '/') {
+                  if (strlen(rel_name) > 0 && rel_name[strlen(rel_name) - 1] != 47) {
                       const uint8_t *comp_data = buf + data_offset;
                       if (hdr->compression == 0 && hdr->uncompressed_size > 0) {
                           FILE *out = fopen(full_out_path, "wb");
@@ -183,7 +181,7 @@ jobs:
                       uint8_t byte_len = str_ptr[1];
                       if (byte_len < sizeof(temp)) {
                           memcpy(temp, str_ptr + 2, byte_len);
-                          temp[byte_len] = '\0';
+                          temp[byte_len] = 0;
                       }
                   } else {
                       uint16_t u16_len = *(const uint16_t *)str_ptr;
@@ -192,10 +190,10 @@ jobs:
                       for (size_t c = 0; c < copy_len; c++) {
                           temp[c] = (char)(u16_chars[c] & 0xFF);
                       }
-                      temp[copy_len] = '\0';
+                      temp[copy_len] = 0;
                   }
 
-                  if (strchr(temp, '.') != NULL &&
+                  if (strchr(temp, 46) != NULL &&
                       strncmp(temp, "android.", 8) != 0 &&
                       strncmp(temp, "http", 4) != 0 &&
                       strncmp(temp, "androidx.", 9) != 0 &&
@@ -283,10 +281,9 @@ jobs:
               }
               return 0;
           }
-          EOF
+          ' > "${BUILD_DIR}/android_core.c"
 
-          # 3. Создаем SwiftUI приложение (DroidModRunnerApp.swift)
-          cat << 'EOF' > "${BUILD_DIR}/DroidModRunnerApp.swift"
+          printf '%s\n' '
           import Foundation
           import SwiftUI
 
@@ -333,7 +330,7 @@ jobs:
           }
 
           final class ModGameAutoEngine: ObservableObject {
-              @Published var statusMessage: String = "Готов к запуску (iOS 14.0+).\nНажмите на любой .APK, .APKS или .XAPK в «Файлах» или Telegram — игра запустится автоматически."
+              @Published var statusMessage: String = "Готов к запуску (iOS 14.0+).\nНажмите на любой .APK, .APKS или .XAPK в Файлах или Telegram."
               @Published var isGameRunning: Bool = false
               @Published var activePackageName: String = ""
               @Published var dexClassCount: Int = 0
@@ -364,4 +361,93 @@ jobs:
                           try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
 
                           DispatchQueue.main.async {
-                              self
+                              self.statusMessage = "Распаковка \(url.lastPathComponent)..."
+                          }
+
+                          let extractedCount = localArchive.path.withCString { srcPtr in
+                              workDir.path.withCString { dstPtr in
+                                  native_unzip_archive(srcPtr, dstPtr)
+                              }
+                          }
+                          if extractedCount <= 0 {
+                              throw NSError(domain: "DroidModRunner", code: 500, userInfo: [NSLocalizedDescriptionKey: "Не удалось распаковать архив пакета"])
+                          }
+
+                          if let subItems = try? fm.contentsOfDirectory(at: workDir, includingPropertiesForKeys: nil) {
+                              for item in subItems where item.pathExtension.lowercased() == "apk" {
+                                  _ = item.path.withCString { srcPtr in
+                                      workDir.path.withCString { dstPtr in
+                                          native_unzip_archive(srcPtr, dstPtr)
+                                      }
+                                  }
+                              }
+                          }
+
+                          var detectedPkg = "com.modded.android.game"
+                          let axmlURL = workDir.appendingPathComponent("AndroidManifest.xml")
+                          if let axmlData = try? Data(contentsOf: axmlURL) {
+                              var cBuf = [CChar](repeating: 0, count: 128)
+                              let res = axmlData.withUnsafeBytes { rawBuf -> Int32 in
+                                  guard let base = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return -1 }
+                                  return cBuf.withUnsafeMutableBufferPointer { charBuf in
+                                      extract_apk_package_info(base, axmlData.count, charBuf.baseAddress, 128)
+                                  }
+                              }
+                              if res == 0 {
+                                  detectedPkg = String(cString: cBuf)
+                              }
+                          }
+
+                          var classesCount = 0
+                          let dexURL = workDir.appendingPathComponent("classes.dex")
+                          if let dexData = try? Data(contentsOf: dexURL) {
+                              classesCount = dexData.withUnsafeBytes { rawBuf -> Int in
+                                  guard let base = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+                                  let c = inspect_dex_file(base, dexData.count)
+                                  return c > 0 ? Int(c) : 0
+                              }
+                          }
+
+                          var soList: [String] = []
+                          var modDetected = false
+                          let arm64Dir = workDir.appendingPathComponent("lib/arm64-v8a")
+                          if let libs = try? fm.contentsOfDirectory(atPath: arm64Dir.path) {
+                              for lib in libs where lib.hasSuffix(".so") {
+                                  soList.append(lib)
+                                  let lower = lib.lowercased()
+                                  if lower.contains("mod") || lower.contains("il2cpp") || lower.contains("dobby") || lower.contains("substrate") {
+                                      modDetected = true
+                                  }
+                              }
+                          }
+
+                          DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                              self.activePackageName = detectedPkg
+                              self.dexClassCount = classesCount
+                              self.loadedNativeLibs = soList
+                              self.hasModOverlay = modDetected
+                              self.isGameRunning = true
+                          }
+                      } catch {
+                          DispatchQueue.main.async {
+                              self.statusMessage = "Ошибка запуска:\n\(error.localizedDescription)"
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct GameViewportContainer: View {
+              let packageName: String
+              let dexClassesCount: Int
+              let nativeLibs: [String]
+              let hasModMenuOverlay: Bool
+              let onExit: () -> Void
+
+              @State private var showModMenuPanel: Bool = true
+              @State private var godModeEnabled: Bool = true
+              @State private var unlimitedCurrency: Bool = true
+
+              var body: some View {
+                  ZStack(alignment: .topLeading) {
+                      Color(red: 0.06, green: 0.07
