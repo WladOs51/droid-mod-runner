@@ -1,0 +1,247 @@
+#include "Bridging-Header.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <compression.h>
+#include <libkern/OSCacheControl.h>
+
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t signature;
+    uint16_t version_needed;
+    uint16_t flags;
+    uint16_t compression;
+    uint16_t mod_time;
+    uint16_t mod_date;
+    uint32_t crc32;
+    uint32_t compressed_size;
+    uint32_t uncompressed_size;
+    uint16_t fname_len;
+    uint16_t extra_len;
+} ZipLocalHeader;
+#pragma pack(pop)
+
+static void mkdir_recursive(const char *path) {
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+}
+
+int native_unzip_archive(const char *zip_path, const char *dest_dir) {
+    FILE *fp = fopen(zip_path, "rb");
+    if (!fp) return -1;
+
+    fseek(fp, 0, SEEK_END);
+    long file_len = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (file_len <= 0) { fclose(fp); return -2; }
+
+    uint8_t *buf = (uint8_t *)malloc(file_len);
+    if (!buf) { fclose(fp); return -3; }
+    fread(buf, 1, file_len, fp);
+    fclose(fp);
+
+    size_t offset = 0;
+    int extracted_files = 0;
+
+    while (offset + sizeof(ZipLocalHeader) <= (size_t)file_len) {
+        const ZipLocalHeader *hdr = (const ZipLocalHeader *)(buf + offset);
+        if (hdr->signature != 0x04034b50) break;
+
+        const char *fname_ptr = (const char *)(buf + offset + sizeof(ZipLocalHeader));
+        char rel_name[512] = {0};
+        size_t copy_len = (hdr->fname_len < 511) ? hdr->fname_len : 511;
+        memcpy(rel_name, fname_ptr, copy_len);
+
+        size_t data_offset = offset + sizeof(ZipLocalHeader) + hdr->fname_len + hdr->extra_len;
+        if (data_offset + hdr->compressed_size > (size_t)file_len) break;
+
+        char full_out_path[1024];
+        snprintf(full_out_path, sizeof(full_out_path), "%s/%s", dest_dir, rel_name);
+        mkdir_recursive(full_out_path);
+
+        if (strlen(rel_name) > 0 && rel_name[strlen(rel_name) - 1] != '/') {
+            const uint8_t *comp_data = buf + data_offset;
+            if (hdr->compression == 0 && hdr->uncompressed_size > 0) {
+                FILE *out = fopen(full_out_path, "wb");
+                if (out) {
+                    fwrite(comp_data, 1, hdr->uncompressed_size, out);
+                    fclose(out);
+                    extracted_files++;
+                }
+            } else if (hdr->compression == 8 && hdr->uncompressed_size > 0) {
+                uint8_t *decomp = (uint8_t *)malloc(hdr->uncompressed_size);
+                if (decomp) {
+                    size_t decoded = compression_decode_buffer(
+                        decomp, hdr->uncompressed_size,
+                        comp_data, hdr->compressed_size,
+                        NULL, COMPRESSION_ZLIB
+                    );
+                    if (decoded > 0) {
+                        FILE *out = fopen(full_out_path, "wb");
+                        if (out) {
+                            fwrite(decomp, 1, decoded, out);
+                            fclose(out);
+                            extracted_files++;
+                        }
+                    }
+                    free(decomp);
+                }
+            }
+        }
+        offset = data_offset + hdr->compressed_size;
+    }
+
+    free(buf);
+    return extracted_files;
+}
+
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t type;
+    uint16_t header_size;
+    uint32_t size;
+} ResChunk_header;
+
+typedef struct {
+    ResChunk_header header;
+    uint32_t stringCount;
+    uint32_t styleCount;
+    uint32_t flags;
+    uint32_t stringsStart;
+    uint32_t stylesStart;
+} ResStringPool_header;
+#pragma pack(pop)
+
+int extract_apk_package_info(const uint8_t *axml_data, size_t len, char *out_pkg, size_t max_pkg_len) {
+    if (len < sizeof(ResChunk_header) + sizeof(ResStringPool_header)) return -1;
+    const ResChunk_header *xml_hdr = (const ResChunk_header *)axml_data;
+    if (xml_hdr->type != 0x0003) return -1;
+
+    const ResStringPool_header *pool = (const ResStringPool_header *)(axml_data + xml_hdr->header_size);
+    if (pool->header.type != 0x0001) return -2;
+
+    int is_utf8 = (pool->flags & 0x0100) != 0;
+    const uint8_t *pool_base = (const uint8_t *)pool;
+    const uint32_t *offsets = (const uint32_t *)(pool_base + pool->header.header_size);
+    const uint8_t *strings_block = pool_base + pool->stringsStart;
+
+    for (uint32_t i = 0; i < pool->stringCount; i++) {
+        if (pool->stringsStart + offsets[i] >= len) continue;
+        const uint8_t *str_ptr = strings_block + offsets[i];
+        char temp[256] = {0};
+
+        if (is_utf8) {
+            uint8_t byte_len = str_ptr[1];
+            if (byte_len < sizeof(temp)) {
+                memcpy(temp, str_ptr + 2, byte_len);
+                temp[byte_len] = '\0';
+            }
+        } else {
+            uint16_t u16_len = *(const uint16_t *)str_ptr;
+            const uint16_t *u16_chars = (const uint16_t *)(str_ptr + 2);
+            size_t copy_len = (u16_len < 255) ? u16_len : 255;
+            for (size_t c = 0; c < copy_len; c++) {
+                temp[c] = (char)(u16_chars[c] & 0xFF);
+            }
+            temp[copy_len] = '\0';
+        }
+
+        if (strchr(temp, '.') != NULL &&
+            strncmp(temp, "android.", 8) != 0 &&
+            strncmp(temp, "http", 4) != 0 &&
+            strncmp(temp, "androidx.", 9) != 0 &&
+            strlen(temp) > 6) {
+            strncpy(out_pkg, temp, max_pkg_len - 1);
+            return 0;
+        }
+    }
+    return -3;
+}
+
+typedef int (*android_jni_entry_t)(int, int);
+
+int execute_android_arm64_so_function(const uint8_t *raw_machine_code, size_t code_size, int arg1, int arg2) {
+    void *jit_page = mmap(NULL, 16384, PROT_READ | PROT_WRITE | PROT_EXEC,
+                          MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
+    if (jit_page == MAP_FAILED) return -1;
+
+    pthread_jit_write_protect_np(0);
+    memcpy(jit_page, raw_machine_code, code_size);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(jit_page, code_size);
+
+    android_jni_entry_t func = (android_jni_entry_t)jit_page;
+    int result = func(arg1, arg2);
+    munmap(jit_page, 16384);
+    return result;
+}
+
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t  magic[8];
+    uint32_t checksum;
+    uint8_t  signature[20];
+    uint32_t file_size;
+    uint32_t header_size;
+    uint32_t endian_tag;
+    uint32_t link_size;
+    uint32_t link_off;
+    uint32_t map_off;
+    uint32_t string_ids_size;
+    uint32_t string_ids_off;
+    uint32_t type_ids_size;
+    uint32_t type_ids_off;
+    uint32_t proto_ids_size;
+    uint32_t proto_ids_off;
+    uint32_t field_ids_size;
+    uint32_t field_ids_off;
+    uint32_t method_ids_size;
+    uint32_t method_ids_off;
+    uint32_t class_defs_size;
+    uint32_t class_defs_off;
+} DexHeader;
+#pragma pack(pop)
+
+int inspect_dex_file(const uint8_t *dex_bytes, size_t len) {
+    if (len < sizeof(DexHeader)) return -1;
+    const DexHeader *hdr = (const DexHeader *)dex_bytes;
+    if (memcmp(hdr->magic, "dex\n", 4) != 0) return -1;
+    return (int)hdr->class_defs_size;
+}
+
+int32_t dalvik_vm_execute_bytecode(const uint16_t *insns, size_t insn_count) {
+    int32_t v[16] = {0};
+    size_t pc = 0;
+    while (pc < insn_count) {
+        uint16_t inst = insns[pc];
+        uint8_t opcode = inst & 0xFF;
+        if (opcode == 0x12) {
+            uint8_t reg_a = (inst >> 8) & 0x0F;
+            int8_t lit_b = (int8_t)(inst >> 12);
+            if (lit_b & 0x08) lit_b |= 0xF0;
+            v[reg_a] = lit_b;
+            pc += 1;
+        } else if (opcode == 0xB0) {
+            uint8_t reg_a = (inst >> 8) & 0x0F;
+            uint8_t reg_b = (inst >> 12) & 0x0F;
+            v[reg_a] += v[reg_b];
+            pc += 1;
+        } else if (opcode == 0x0F) {
+            uint8_t reg_ret = (inst >> 8) & 0xFF;
+            return v[reg_ret];
+        } else {
+            break;
+        }
+    }
+    return 0;
+}
