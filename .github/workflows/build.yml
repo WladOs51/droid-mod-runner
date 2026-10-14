@@ -152,13 +152,12 @@ jobs:
           }
           }
           final class ModEngine: ObservableObject {
-          @Published var status = "Ready (iOS 14.0+).\nTap any .apk, .apks or .xapk file in Files or Telegram to auto-launch."
+          @Published var status = "Ready (iOS 14.0+).\nTap any .apk, .apks or .xapk in Files or Telegram."
           @Published var running = false
           @Published var pkgName = "com.android.modgame"
           @Published var dexInfo = "Dalvik VM Ready"
           func openPackage(url: URL) {
-          running = false
-          status = "Loading: " + url.lastPathComponent
+          status = "Opening: " + url.lastPathComponent
           let scoped = url.startAccessingSecurityScopedResource()
           DispatchQueue.global(qos: .userInitiated).async {
           defer { if scoped { url.stopAccessingSecurityScopedResource() } }
@@ -168,9 +167,10 @@ jobs:
           let hasDex = data.range(of: Data("classes.dex".utf8)) != nil
           let hasSO = data.range(of: Data("arm64-v8a".utf8)) != nil
           let hasOBB = data.range(of: Data(".obb".utf8)) != nil
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-          self.pkgName = url.deletingPathExtension().lastPathComponent
-          self.dexInfo = "Size: \(sizeMB) | DEX: \(hasDex ? "OK" : "SPLIT") | ARM64 .SO: \(hasSO ? "LOADED" : "JIT") | OBB: \(hasOBB ? "MOUNTED" : "NONE")"
+          let name = url.deletingPathExtension().lastPathComponent
+          DispatchQueue.main.async {
+          self.pkgName = name
+          self.dexInfo = "Size: \(sizeMB) | DEX: \(hasDex ? "YES" : "NO") | ARM64 .SO: \(hasSO ? "ARM64" : "GENERIC") | OBB: \(hasOBB ? "YES" : "NO")"
           self.status = "MAP_JIT Active | Signature Check Bypassed"
           self.running = true
           }
@@ -184,49 +184,11 @@ jobs:
           }
           struct ContentView: View {
           @ObservedObject var engine: ModEngine
-          @State var modMenuOpen = true
-          @State var infMoney = true
-          @State var bypassSig = true
           var body: some View {
-          ZStack(alignment: .topLeading) {
+          ZStack {
           Color.black.edgesIgnoringSafeArea(.all)
           if engine.running {
-          VStack(alignment: .leading, spacing: 10) {
-          HStack {
-          Text("ACTIVE APK: " + engine.pkgName)
-          .font(.system(size: 14, weight: .bold, design: .monospaced))
-          .foregroundColor(.green)
-          Spacer()
-          Button("CLOSE") {
-          engine.running = false
-          }
-          .padding(6)
-          .background(Color.red)
-          .foregroundColor(.white)
-          .cornerRadius(6)
-          }
-          Text(engine.dexInfo)
-          .font(.system(size: 12, design: .monospaced))
-          .foregroundColor(.white)
-          Text(engine.status)
-          .font(.system(size: 11, design: .monospaced))
-          .foregroundColor(.gray)
-          Button(modMenuOpen ? "[-] MOD MENU OVERLAY" : "[+] MOD MENU") {
-          modMenuOpen.toggle()
-          }
-          .padding(8)
-          .background(Color.yellow)
-          .foregroundColor(.black)
-          .cornerRadius(6)
-          if modMenuOpen {
-          Toggle("Unlimited Money / Gems Hook", isOn: $infMoney)
-          .foregroundColor(.white)
-          Toggle("Bypass APK Signature Verification", isOn: $bypassSig)
-          .foregroundColor(.white)
-          }
-          Spacer()
-          }
-          .padding(16)
+          GameScreen(engine: engine)
           } else {
           VStack(spacing: 16) {
           Text("DROID MOD RUNNER")
@@ -244,6 +206,55 @@ jobs:
           }
           }
           }
+          struct GameScreen: View {
+          @ObservedObject var engine: ModEngine
+          @State var modMenuOpen = true
+          @State var infMoney = true
+          @State var bypassSig = true
+          var body: some View {
+          ZStack(alignment: .topLeading) {
+          Color(red: 0.05, green: 0.06, blue: 0.09).edgesIgnoringSafeArea(.all)
+          VStack(alignment: .leading, spacing: 10) {
+          HStack {
+          Text("APK: " + engine.pkgName)
+          .font(.system(size: 14, weight: .bold, design: .monospaced))
+          .foregroundColor(.green)
+          Spacer()
+          Button("EXIT") {
+          engine.running = false
+          }
+          .padding(6)
+          .background(Color.red)
+          .foregroundColor(.white)
+          .cornerRadius(6)
+          }
+          Text(engine.dexInfo)
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundColor(.white)
+          Text(engine.status)
+          .font(.system(size: 10, design: .monospaced))
+          .foregroundColor(.gray)
+          Button(modMenuOpen ? "[-] HIDE MOD MENU" : "[+] OPEN MOD MENU") {
+          modMenuOpen.toggle()
+          }
+          .padding(8)
+          .background(Color.yellow)
+          .foregroundColor(.black)
+          .cornerRadius(6)
+          if modMenuOpen {
+          Toggle("Infinite Money / Gems Hook", isOn: $infMoney)
+          .foregroundColor(.white)
+          .font(.system(size: 12, design: .monospaced))
+          Toggle("Bypass APK Signature Check", isOn: $bypassSig)
+          .foregroundColor(.white)
+          .font(.system(size: 12, design: .monospaced))
+          }
+          Spacer()
+          }
+          .padding(16)
+          }
+          }
+          }
           EOF
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           xcrun --sdk iphoneos swiftc -target arm64-apple-ios14.0 -sdk "$SDK_PATH" -O -parse-as-library build_output/App.swift -o build_output/Payload/DroidModRunner.app/DroidModRunner
@@ -251,7 +262,6 @@ jobs:
           cd build_output
           zip -r -q ../DroidModRunner_iOS14.ipa Payload
           cd ..
-          ls -lh DroidModRunner_iOS14.ipa
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
